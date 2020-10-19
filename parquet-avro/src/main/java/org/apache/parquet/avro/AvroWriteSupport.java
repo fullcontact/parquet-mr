@@ -1,4 +1,4 @@
-/* 
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -6,9 +6,9 @@
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * 
+ *
  *   http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
@@ -28,6 +28,7 @@ import org.apache.avro.LogicalType;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericFixed;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.IndexedRecord;
 import org.apache.avro.util.Utf8;
 import org.apache.hadoop.conf.Configuration;
@@ -39,6 +40,8 @@ import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.Type;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.parquet.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Avro implementation of {@link WriteSupport} for generic, specific, and
@@ -46,6 +49,7 @@ import org.apache.parquet.Preconditions;
  * {@link AvroParquetOutputFormat} rather than using this class directly.
  */
 public class AvroWriteSupport<T> extends WriteSupport<T> {
+  private static final Logger LOG = LoggerFactory.getLogger(AvroWriteSupport.class);
 
   public static final String AVRO_DATA_SUPPLIER = "parquet.avro.write.data.supplier";
 
@@ -178,14 +182,30 @@ public class AvroWriteSupport<T> extends WriteSupport<T> {
                                  Object record) {
     List<Type> fields = schema.getFields();
     List<Schema.Field> avroFields = avroSchema.getFields();
+    Schema recordSchema = ((GenericData.Record) record).getSchema();
     int index = 0; // parquet ignores Avro nulls, so index may differ
-    for (int avroIndex = 0; avroIndex < avroFields.size(); avroIndex++) {
+    int maxFields = avroFields.size();
+
+    if (maxFields > recordSchema.getFields().size()) {
+      LOG.warn("Number of fields in our record did not match the number of fields in the Schema. {} {}",
+        maxFields, recordSchema.getFields().size());
+      maxFields = recordSchema.getFields().size();
+    }
+
+    for (int avroIndex = 0; avroIndex < maxFields; avroIndex++) {
       Schema.Field avroField = avroFields.get(avroIndex);
       if (avroField.schema().getType().equals(Schema.Type.NULL)) {
         continue;
       }
       Type fieldType = fields.get(index);
       Object value = model.getField(record, avroField.name(), avroIndex);
+      Schema.Field recordSchemaField = recordSchema.getFields().get(avroIndex);
+
+      if (!recordSchemaField.equals(avroField)) {
+        throw new RuntimeException(String.format("Field that Schema writer was constructed with (%s) and " +
+          "field from incoming record (%s) do not match", avroField, recordSchemaField));
+      }
+
       if (value != null) {
         recordConsumer.startField(fieldType.getName(), index);
         writeValue(fieldType, avroField.schema(), value);
@@ -195,6 +215,22 @@ public class AvroWriteSupport<T> extends WriteSupport<T> {
       }
       index++;
     }
+
+    // Set default values for any leftover fields that were not present in incoming record
+    for (int avroIndex = maxFields; avroIndex < avroFields.size(); avroIndex++) {
+      Object defaultVal = avroFields.get(avroIndex).defaultVal();
+      Schema.Field avroField = avroFields.get(avroIndex);
+      Type fieldType = fields.get(index);
+      if (defaultVal != null) {
+        recordConsumer.startField(fieldType.getName(), index);
+        writeValue(fieldType, avroField.schema(), defaultVal);
+        recordConsumer.endField(fieldType.getName(), index);
+      } else if (fieldType.isRepetition(Type.Repetition.REQUIRED)) {
+        throw new RuntimeException("No default value provided for required field: " + avroField.name());
+      }
+      index++;
+    }
+
   }
 
   private <V> void writeMap(GroupType schema, Schema avroSchema,
@@ -228,7 +264,7 @@ public class AvroWriteSupport<T> extends WriteSupport<T> {
     recordConsumer.endGroup();
   }
 
-  private void writeUnion(GroupType parquetSchema, Schema avroSchema, 
+  private void writeUnion(GroupType parquetSchema, Schema avroSchema,
                           Object value) {
     recordConsumer.startGroup();
 
